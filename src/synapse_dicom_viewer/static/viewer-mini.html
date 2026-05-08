@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DICOM viewer</title>
+<style>
+  :root { --fg: #e5e7eb; --muted: #9ca3af; --accent: #6ea8fe; --bg: #000; --panel: rgba(20,20,22,0.85); }
+  body, html { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, system-ui, sans-serif; overflow: hidden;
+    overscroll-behavior: none; }
+  /* Prevent trackpad horizontal swipe from triggering browser back/forward */
+  #viewport { touch-action: none; overscroll-behavior: none;
+    user-select: none; -webkit-user-select: none; }
+
+  /* Top bar: study + series picker */
+  #topbar { position: fixed; top: 0; left: 0; right: 0; padding: .5rem .9rem;
+    background: var(--panel); z-index: 10; display: flex; gap: 1rem; align-items: center;
+    font-size: .85rem; border-bottom: 1px solid #222; }
+  #topbar a { color: var(--accent); text-decoration: none; }
+  #info { color: var(--muted); }
+  select { background: #18181b; color: var(--fg); border: 1px solid #333; padding: .25rem .4rem;
+    border-radius: 3px; font: inherit; }
+
+  /* Viewport */
+  #viewport { position: absolute; top: 44px; left: 0; right: 320px; bottom: 96px;
+    background: #000; transition: right .2s ease; }
+  body.panel-collapsed #viewport { right: 0; }
+  body.panel-collapsed #sidepanel { transform: translateX(100%); }
+
+  /* Side panel: DICOM metadata */
+  #sidepanel { position: fixed; top: 44px; right: 0; bottom: 96px; width: 320px;
+    background: rgba(15,15,18,0.95); border-left: 1px solid #222; z-index: 9;
+    overflow-y: auto; transition: transform .2s ease; }
+  #sidepanel section { border-bottom: 1px solid #1f1f23; padding: .65rem .9rem; }
+  #sidepanel h4 { margin: 0 0 .4rem; font-size: .72rem; text-transform: uppercase;
+    letter-spacing: .08em; color: var(--accent); font-weight: 600; }
+  #sidepanel dl { margin: 0; display: grid; grid-template-columns: 7.5rem 1fr; gap: .15rem .6rem; font-size: .78rem; }
+  #sidepanel dt { color: var(--muted); }
+  #sidepanel dd { margin: 0; color: var(--fg); font-variant-numeric: tabular-nums;
+    word-break: break-word; }
+  #sidepanel dd.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .73rem; }
+  #panel-toggle { background: transparent; color: var(--muted); border: 1px solid #333;
+    padding: .15rem .45rem; border-radius: 3px; cursor: pointer; font-size: .75rem; }
+  #panel-toggle:hover { color: var(--accent); border-color: var(--accent); }
+
+  /* Bottom panel: slice slider + tools */
+  #bottombar { position: fixed; bottom: 0; left: 0; right: 0; padding: .55rem .9rem;
+    background: var(--panel); border-top: 1px solid #222; z-index: 10;
+    display: grid; grid-template-rows: auto auto; gap: .55rem; }
+  .row { display: flex; gap: .8rem; align-items: center; font-size: .82rem; }
+  .row .grow { flex: 1; }
+  #slice-readout { color: var(--fg); font-variant-numeric: tabular-nums; min-width: 6.5rem; }
+  #slice-slider { flex: 1; accent-color: var(--accent); cursor: pointer; }
+  .pill { padding: .15rem .55rem; border-radius: 3px; background: #18181b; color: var(--muted);
+    border: 1px solid #2a2a2a; font-variant-numeric: tabular-nums; }
+  .pill b { color: var(--fg); font-weight: 500; }
+
+  .tool { display: inline-flex; align-items: center; gap: .35rem; color: var(--muted); }
+  .tool kbd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .7rem;
+    padding: .1rem .35rem; border: 1px solid #333; border-radius: 3px; background: #18181b;
+    color: var(--fg); }
+  button.btn { background: #18181b; color: var(--fg); border: 1px solid #333; padding: .25rem .65rem;
+    border-radius: 3px; font: inherit; cursor: pointer; }
+  button.btn:hover { border-color: var(--accent); color: var(--accent); }
+
+  #status { color: var(--muted); }
+  #error { color: #fca5a5; }
+
+  /* Bottom bar should stop at the side panel edge so it doesn't overlap */
+  #bottombar { right: 320px; transition: right .2s ease; }
+  body.panel-collapsed #bottombar { right: 0; }
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <a href="/?noredirect=1">← studies</a>
+  <span id="info">loading…</span>
+  <span class="grow"></span>
+  <span style="color: var(--muted)">Series:</span>
+  <select id="series-picker"></select>
+  <button id="panel-toggle" title="Toggle metadata panel (M)">metadata ›</button>
+</div>
+
+<div id="viewport" oncontextmenu="return false"></div>
+<aside id="sidepanel"></aside>
+
+<div id="bottombar">
+  <div class="row">
+    <span id="slice-readout">slice — / —</span>
+    <input type="range" id="slice-slider" min="0" max="0" value="0" step="1">
+    <span class="pill" id="wl-readout">W/L —</span>
+    <button class="btn" id="auto-btn" title="Sample slices, set W/L from 1st-99th percentile, lock across stack (A)">Auto W/L</button>
+    <button class="btn" id="reset-btn" title="Reset zoom + per-slice W/L (R)">Reset</button>
+  </div>
+  <div class="row" style="color: var(--muted)">
+    <span class="tool"><kbd>scroll</kbd> slice</span>
+    <span class="tool"><kbd>drag</kbd> window/level</span>
+    <span class="tool"><kbd>shift + drag</kbd> zoom</span>
+    <span class="tool"><kbd>middle drag</kbd> pan</span>
+    <span class="tool"><kbd>A</kbd> auto</span>
+    <span class="tool"><kbd>R</kbd> reset</span>
+    <span class="grow"></span>
+    <span id="status"></span>
+    <span id="error"></span>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dicom-parser@1.8.21/dist/dicomParser.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cornerstone-core@2.6.1/dist/cornerstone.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cornerstone-math@0.1.10/dist/cornerstoneMath.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cornerstone-wado-image-loader@4.13.2/dist/cornerstoneWADOImageLoaderNoWebWorkers.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cornerstone-tools@6.0.10/dist/cornerstoneTools.min.js"></script>
+
+<script>
+window.addEventListener('error', e => showError('script error: ' + (e.message || e.error)));
+window.addEventListener('unhandledrejection', e => showError('async error: ' + (e.reason?.message || e.reason)));
+function showError(msg) { document.getElementById('error').textContent = msg; console.error(msg); }
+function setStatus(msg) { document.getElementById('status').textContent = msg; }
+
+for (const [name, obj] of [
+  ['Hammer', typeof Hammer !== 'undefined' && Hammer],
+  ['dicomParser', typeof dicomParser !== 'undefined' && dicomParser],
+  ['cornerstone', typeof cornerstone !== 'undefined' && cornerstone],
+  ['cornerstoneMath', typeof cornerstoneMath !== 'undefined' && cornerstoneMath],
+  ['cornerstoneWADOImageLoader', typeof cornerstoneWADOImageLoader !== 'undefined' && cornerstoneWADOImageLoader],
+  ['cornerstoneTools', typeof cornerstoneTools !== 'undefined' && cornerstoneTools],
+]) if (!obj) showError('library failed to load: ' + name);
+
+cornerstoneTools.external.cornerstone = cornerstone;
+cornerstoneTools.external.cornerstoneMath = cornerstoneMath;
+cornerstoneTools.external.Hammer = Hammer;
+cornerstoneWADOImageLoader.external.cornerstone = cornerstone;
+cornerstoneWADOImageLoader.external.dicomParser = dicomParser;
+
+// Inject Synapse PAT (hosted mode) on every WADO + QIDO request.
+const SS_PAT_KEY = 'synapseDicomViewer.pat';
+function getStoredToken() { return sessionStorage.getItem(SS_PAT_KEY) || ''; }
+cornerstoneWADOImageLoader.configure({
+  useWebWorkers: false,
+  beforeSend: (xhr) => {
+    const t = getStoredToken();
+    if (t) xhr.setRequestHeader('X-Synapse-Token', t);
+  },
+});
+// Also patch global fetch for our QIDO/metadata calls.
+const _origFetch = window.fetch.bind(window);
+window.fetch = (input, init = {}) => {
+  const t = getStoredToken();
+  if (t) {
+    const headers = new Headers(init.headers || (typeof input !== 'string' && input.headers) || {});
+    headers.set('X-Synapse-Token', t);
+    init = { ...init, headers };
+  }
+  return _origFetch(input, init);
+};
+cornerstone.registerImageLoader('wadouri', cornerstoneWADOImageLoader.wadouri.loadImage);
+cornerstone.registerImageLoader('wadors', cornerstoneWADOImageLoader.wadors.loadImage);
+cornerstoneTools.init();
+
+const params = new URLSearchParams(location.search);
+const studyUID = params.get('StudyInstanceUIDs');
+const viewport = document.getElementById('viewport');
+const info = document.getElementById('info');
+const seriesPicker = document.getElementById('series-picker');
+const slider = document.getElementById('slice-slider');
+const sliceReadout = document.getElementById('slice-readout');
+const wlReadout = document.getElementById('wl-readout');
+
+cornerstone.enable(viewport);
+
+let currentImageIds = [];
+let currentMetadata = [];   // parallel to currentImageIds, sorted by InstanceNumber
+let currentIdx = 0;
+let toolsAdded = false;
+let lockedVoi = null;  // {windowWidth, windowCenter} when Auto W/L is active
+let prefetchGen = 0;   // bumped on each series load to cancel any in-flight prefetch
+
+const PREFETCH_CONCURRENCY = 6;
+const PREFETCH_BUDGET_BYTES = 256 * 1024 * 1024;  // 256 MB cap, tweak as needed
+
+// Match cornerstone's image cache to the prefetch budget so prefetched images
+// don't get LRU-evicted before the user reaches them.
+cornerstone.imageCache.setMaximumSizeBytes(PREFETCH_BUDGET_BYTES);
+
+function orderFromCenter(arr, center) {
+  // Walk outward from `center` so nearby slices warm first.
+  const out = [];
+  for (let r = 0; out.length < arr.length; r++) {
+    if (r === 0) { out.push(arr[center]); continue; }
+    if (center - r >= 0) out.push(arr[center - r]);
+    if (center + r < arr.length) out.push(arr[center + r]);
+  }
+  return out;
+}
+
+function estimateInstanceBytes(meta) {
+  // Estimate the in-memory size of a decoded image from the DICOM geometry tags.
+  // (Wire-format DICOM is similar — pixel data dominates the file size.)
+  const rows = meta?.['00280010']?.Value?.[0] ?? 512;
+  const cols = meta?.['00280011']?.Value?.[0] ?? 512;
+  const bits = meta?.['00280100']?.Value?.[0] ?? 16;
+  const samples = meta?.['00280002']?.Value?.[0] ?? 1;
+  const frames = meta?.['00280008']?.Value?.[0] ?? 1;
+  return rows * cols * (bits / 8) * samples * frames + 8192;  // +8KB header overhead
+}
+
+async function prefetchSeries(imageIds, startIdx) {
+  const myGen = ++prefetchGen;
+
+  const perInstance = estimateInstanceBytes(currentMetadata[startIdx]);
+  const maxSlices = Math.max(1, Math.floor(PREFETCH_BUDGET_BYTES / perInstance));
+  const target = Math.min(maxSlices, imageIds.length);
+  const queue = orderFromCenter(imageIds, startIdx).slice(0, target);
+  const skipped = imageIds.length - target;
+
+  let done = 0;
+  const tick = () => {
+    if (myGen !== prefetchGen) return;
+    if (done < target) {
+      const note = skipped ? ` (closest ${target} of ${imageIds.length})` : '';
+      setStatus(`prefetching ${done}/${target}${note}`);
+    } else {
+      setStatus(skipped ? `prefetched ${target}/${imageIds.length} (budget cap)` : '');
+    }
+  };
+  tick();
+
+  const worker = async () => {
+    while (queue.length && myGen === prefetchGen) {
+      const id = queue.shift();
+      try { await cornerstone.loadAndCacheImage(id); } catch (e) { /* keep going */ }
+      done++;
+      if (done % 8 === 0 || done === target) tick();
+    }
+  };
+  await Promise.all(Array.from({length: PREFETCH_CONCURRENCY}, worker));
+  tick();
+}
+
+async function autoWindowLevel() {
+  if (!currentImageIds.length) return;
+  setStatus('sampling slices for auto W/L…');
+  const N = Math.min(7, currentImageIds.length);
+  const indices = N === 1 ? [0]
+    : Array.from({length: N}, (_, i) => Math.round(i * (currentImageIds.length - 1) / (N - 1)));
+  const samples = [];
+  for (const idx of indices) {
+    const img = await cornerstone.loadAndCacheImage(currentImageIds[idx]);
+    const px = img.getPixelData();
+    const slope = img.slope ?? 1;
+    const intercept = img.intercept ?? 0;
+    // Subsample for speed (every 4th pixel is plenty)
+    for (let i = 0; i < px.length; i += 4) {
+      samples.push(px[i] * slope + intercept);
+    }
+  }
+  samples.sort((a, b) => a - b);
+  const lo = samples[Math.floor(samples.length * 0.01)];
+  const hi = samples[Math.floor(samples.length * 0.99)];
+  const ww = Math.max(1, hi - lo);
+  const wc = (hi + lo) / 2;
+  lockedVoi = { windowWidth: ww, windowCenter: wc };
+  applyLockedVoi();
+  setStatus('');
+}
+
+function applyLockedVoi() {
+  if (!lockedVoi) return;
+  const vp = cornerstone.getViewport(viewport);
+  if (!vp) return;
+  vp.voi.windowWidth = lockedVoi.windowWidth;
+  vp.voi.windowCenter = lockedVoi.windowCenter;
+  cornerstone.setViewport(viewport, vp);
+}
+
+// When the stack scrolls, cornerstone re-applies the new image's stored W/L.
+// Re-apply our locked W/L on every new image so scrolling stays stable.
+viewport.addEventListener('cornerstonenewimage', () => applyLockedVoi());
+
+async function loadSeries(seriesUID) {
+  setStatus('fetching metadata…');
+  // The /metadata endpoint has everything we need for both rendering and the side panel,
+  // so a single fetch replaces /instances.
+  const r = await fetch(`/dicom-web/studies/${encodeURIComponent(studyUID)}/series/${encodeURIComponent(seriesUID)}/metadata`);
+  const meta = await r.json();
+  meta.sort((a, b) => ((a['00200013']?.Value?.[0]) ?? 0) - ((b['00200013']?.Value?.[0]) ?? 0));
+  currentMetadata = meta;
+  currentImageIds = meta.map(inst => {
+    const sop = inst['00080018'].Value[0];
+    return `wadouri:${location.origin}/dicom-web/studies/${encodeURIComponent(studyUID)}/series/${encodeURIComponent(seriesUID)}/instances/${encodeURIComponent(sop)}`;
+  });
+
+  const startIdx = Math.floor(currentImageIds.length / 2);
+  setStatus(`${currentImageIds.length} slices · loading slice ${startIdx + 1}…`);
+  slider.max = currentImageIds.length - 1;
+  slider.value = startIdx;
+
+  const image = await cornerstone.loadAndCacheImage(currentImageIds[startIdx]);
+  cornerstone.displayImage(viewport, image);
+  cornerstone.fitToWindow(viewport);
+
+  cornerstoneTools.clearToolState(viewport, 'stack');
+  cornerstoneTools.addStackStateManager(viewport, ['stack']);
+  cornerstoneTools.addToolState(viewport, 'stack', { currentImageIdIndex: startIdx, imageIds: currentImageIds });
+
+  if (!toolsAdded) {
+    cornerstoneTools.addTool(cornerstoneTools.StackScrollMouseWheelTool);
+    cornerstoneTools.addTool(cornerstoneTools.WwwcTool);
+    cornerstoneTools.addTool(cornerstoneTools.PanTool);
+    cornerstoneTools.addTool(cornerstoneTools.ZoomTool);
+    toolsAdded = true;
+  }
+  cornerstoneTools.setToolActive('StackScrollMouseWheel', {});
+  cornerstoneTools.setToolActive('Wwwc', { mouseButtonMask: 1 });
+  cornerstoneTools.setToolActive('Zoom', { mouseButtonMask: 1, modifierKey: 16 /* shift */ });
+  cornerstoneTools.setToolActive('Pan', { mouseButtonMask: 4 });
+
+  // Run auto W/L on series load so the stack is consistently exposed by default.
+  await autoWindowLevel();
+  currentIdx = startIdx;
+  renderPanel();
+
+  // Kick off background prefetch so scrolling is instant after the first few seconds.
+  // Don't await — scrolling and W/L should remain responsive while it runs.
+  prefetchSeries(currentImageIds, startIdx);
+}
+
+function updateReadouts() {
+  const stackData = cornerstoneTools.getToolState(viewport, 'stack');
+  const idx = stackData?.data?.[0]?.currentImageIdIndex ?? 0;
+  if (idx !== currentIdx) {
+    currentIdx = idx;
+    renderPanel();
+  }
+  sliceReadout.innerHTML = `slice <b>${idx + 1}</b> / ${currentImageIds.length}`;
+  if (slider.value != idx) slider.value = idx;
+  const vp = cornerstone.getViewport(viewport);
+  if (vp?.voi) {
+    wlReadout.innerHTML = `W/L <b>${Math.round(vp.voi.windowWidth)} / ${Math.round(vp.voi.windowCenter)}</b>`;
+  }
+}
+
+// ---------------- Side panel: DICOM metadata --------------------------------
+
+const TAG = {
+  PatientName: '00100010', PatientID: '00100020', PatientSex: '00100040',
+  PatientAge: '00101010', PatientBirthDate: '00100030',
+  StudyDate: '00080020', StudyTime: '00080030', StudyDescription: '00081030',
+  AccessionNumber: '00080050', ReferringPhysician: '00080090',
+  StudyInstanceUID: '0020000D',
+  Modality: '00080060', SeriesNumber: '00200011', SeriesDescription: '0008103E',
+  BodyPart: '00180015', ProtocolName: '00181030', ImageType: '00080008',
+  SeriesInstanceUID: '0020000E',
+  TR: '00180080', TE: '00180081', TI: '00180082', FlipAngle: '00181314',
+  ScanSeq: '00180020', SeqVar: '00180021', Contrast: '00180010',
+  Manufacturer: '00080070', Model: '00081090', Station: '00081010', Software: '00181020',
+  AcqDate: '00080022', AcqTime: '00080032',
+  InstanceNumber: '00200013', SOPInstanceUID: '00080018',
+  Rows: '00280010', Columns: '00280011',
+  BitsAllocated: '00280100', BitsStored: '00280101',
+  PixelSpacing: '00280030', SliceThickness: '00180050',
+  ImagePosition: '00200032', ImageOrientation: '00200037',
+  WindowCenter: '00281050', WindowWidth: '00281051',
+  RescaleSlope: '00281053', RescaleIntercept: '00281052',
+  TransferSyntax: '00020010',
+};
+
+const v = (m, tag) => m?.[tag]?.Value;
+const v0 = (m, tag) => m?.[tag]?.Value?.[0];
+const vList = (m, tag, sep = ' / ') => m?.[tag]?.Value?.join(sep);
+
+function pn(m, tag) {
+  const o = v0(m, tag);
+  return typeof o === 'object' ? o.Alphabetic : o;
+}
+function fmtDate(s) {
+  if (!s || s.length < 8) return s || '—';
+  return `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}`;
+}
+function fmtTime(s) {
+  if (!s || s.length < 4) return s || '—';
+  const h = s.slice(0,2), m = s.slice(2,4), sec = s.slice(4,6) || '00';
+  return `${h}:${m}:${sec}`;
+}
+function fmtNumList(arr, units = '', digits = 3) {
+  if (!arr) return '—';
+  return arr.map(x => Number(x).toFixed(digits).replace(/\.?0+$/, '')).join(' · ') + (units ? ' ' + units : '');
+}
+
+function row(label, value, mono = false) {
+  if (value === undefined || value === null || value === '' || value === '—') return '';
+  return `<dt>${label}</dt><dd${mono ? ' class="mono"' : ''}>${value}</dd>`;
+}
+
+function renderPanel() {
+  const m = currentMetadata[currentIdx];
+  const panel = document.getElementById('sidepanel');
+  if (!m) { panel.innerHTML = ''; return; }
+
+  const sex = v0(m, TAG.PatientSex);
+  const age = v0(m, TAG.PatientAge);
+  const dob = v0(m, TAG.PatientBirthDate);
+  const studyDateTime = [fmtDate(v0(m, TAG.StudyDate)), fmtTime(v0(m, TAG.StudyTime))].filter(x => x !== '—').join(' ');
+  const acqDateTime = [fmtDate(v0(m, TAG.AcqDate)), fmtTime(v0(m, TAG.AcqTime))].filter(x => x !== '—').join(' ');
+  const tr = v0(m, TAG.TR), te = v0(m, TAG.TE), ti = v0(m, TAG.TI);
+  const trte = [tr, te, ti].some(x => x != null) ? `${tr ?? '—'} / ${te ?? '—'} / ${ti ?? '—'} ms` : null;
+
+  panel.innerHTML = `
+    <section>
+      <h4>Patient</h4>
+      <dl>
+        ${row('Name', pn(m, TAG.PatientName))}
+        ${row('ID', v0(m, TAG.PatientID))}
+        ${row('Sex / age', sex || age ? `${sex ?? '—'} / ${age ?? '—'}` : null)}
+        ${row('Birth date', dob ? fmtDate(dob) : null)}
+      </dl>
+    </section>
+    <section>
+      <h4>Study</h4>
+      <dl>
+        ${row('Date', studyDateTime)}
+        ${row('Description', v0(m, TAG.StudyDescription))}
+        ${row('Accession', v0(m, TAG.AccessionNumber))}
+        ${row('Referring', pn(m, TAG.ReferringPhysician))}
+        ${row('Study UID', v0(m, TAG.StudyInstanceUID), true)}
+      </dl>
+    </section>
+    <section>
+      <h4>Series</h4>
+      <dl>
+        ${row('Number', v0(m, TAG.SeriesNumber))}
+        ${row('Description', v0(m, TAG.SeriesDescription))}
+        ${row('Modality', v0(m, TAG.Modality))}
+        ${row('Body part', v0(m, TAG.BodyPart))}
+        ${row('Protocol', v0(m, TAG.ProtocolName))}
+        ${row('Image type', vList(m, TAG.ImageType, ' / '))}
+        ${row('Series UID', v0(m, TAG.SeriesInstanceUID), true)}
+      </dl>
+    </section>
+    <section>
+      <h4>Acquisition</h4>
+      <dl>
+        ${row('Acquired', acqDateTime)}
+        ${row('TR / TE / TI', trte)}
+        ${row('Flip angle', v0(m, TAG.FlipAngle) != null ? `${v0(m, TAG.FlipAngle)}°` : null)}
+        ${row('Sequence', vList(m, TAG.ScanSeq, ' · '))}
+        ${row('Variant', vList(m, TAG.SeqVar, ' · '))}
+        ${row('Contrast', v0(m, TAG.Contrast))}
+      </dl>
+    </section>
+    <section>
+      <h4>Image</h4>
+      <dl>
+        ${row('Instance', v0(m, TAG.InstanceNumber))}
+        ${row('Rows × cols', `${v0(m, TAG.Rows)} × ${v0(m, TAG.Columns)}`)}
+        ${row('Pixel spacing', fmtNumList(v(m, TAG.PixelSpacing), 'mm'))}
+        ${row('Slice thickness', v0(m, TAG.SliceThickness) != null ? `${v0(m, TAG.SliceThickness)} mm` : null)}
+        ${row('Bit depth', `${v0(m, TAG.BitsAllocated)} (stored ${v0(m, TAG.BitsStored)})`)}
+        ${row('Position', fmtNumList(v(m, TAG.ImagePosition), 'mm', 2), true)}
+        ${row('Orientation', fmtNumList(v(m, TAG.ImageOrientation), '', 4), true)}
+        ${row('Stored W/L', `${v0(m, TAG.WindowWidth) ?? '—'} / ${v0(m, TAG.WindowCenter) ?? '—'}`)}
+        ${row('Rescale', v0(m, TAG.RescaleSlope) != null
+            ? `slope ${v0(m, TAG.RescaleSlope)} · intercept ${v0(m, TAG.RescaleIntercept)}` : null)}
+      </dl>
+    </section>
+    <section>
+      <h4>Source</h4>
+      <dl>
+        ${row('Manufacturer', v0(m, TAG.Manufacturer))}
+        ${row('Model', v0(m, TAG.Model))}
+        ${row('Station', v0(m, TAG.Station))}
+        ${row('Software', v0(m, TAG.Software))}
+        ${row('Transfer syntax', v0(m, TAG.TransferSyntax), true)}
+        ${row('SOP UID', v0(m, TAG.SOPInstanceUID), true)}
+      </dl>
+    </section>
+  `;
+}
+
+// Toggle panel
+const panelToggle = document.getElementById('panel-toggle');
+function setPanel(open) {
+  document.body.classList.toggle('panel-collapsed', !open);
+  panelToggle.textContent = open ? 'metadata ›' : '‹ metadata';
+  // Resize cornerstone after the transition completes so the image refits.
+  setTimeout(() => { try { cornerstone.resize(viewport, true); } catch {} }, 220);
+}
+panelToggle.addEventListener('click', () => setPanel(document.body.classList.contains('panel-collapsed')));
+
+viewport.addEventListener('cornerstoneimagerendered', updateReadouts);
+
+slider.addEventListener('input', async () => {
+  const idx = parseInt(slider.value, 10);
+  const stackData = cornerstoneTools.getToolState(viewport, 'stack');
+  if (stackData?.data?.[0]) {
+    stackData.data[0].currentImageIdIndex = idx;
+    const image = await cornerstone.loadAndCacheImage(currentImageIds[idx]);
+    cornerstone.displayImage(viewport, image);
+  }
+});
+
+document.getElementById('auto-btn').addEventListener('click', autoWindowLevel);
+document.getElementById('reset-btn').addEventListener('click', () => {
+  lockedVoi = null;
+  cornerstone.reset(viewport);
+});
+window.addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
+  if (e.key === 'r' || e.key === 'R') { lockedVoi = null; cornerstone.reset(viewport); }
+  if (e.key === 'a' || e.key === 'A') autoWindowLevel();
+  if (e.key === 'm' || e.key === 'M') setPanel(document.body.classList.contains('panel-collapsed'));
+});
+
+async function init() {
+  if (!studyUID) { info.textContent = 'no StudyInstanceUIDs in URL'; return; }
+  const r = await fetch(`/dicom-web/studies/${encodeURIComponent(studyUID)}/series`);
+  const seriesList = await r.json();
+  if (!seriesList.length) { info.textContent = 'no series found'; return; }
+  info.textContent = `${seriesList.length} series · study ${studyUID.substring(0, 28)}…`;
+  for (const s of seriesList) {
+    const opt = document.createElement('option');
+    opt.value = s['0020000E'].Value[0];
+    const desc = s['0008103E']?.Value?.[0] || '';
+    const num = s['00200011']?.Value?.[0] ?? '?';
+    const n = s['00201209']?.Value?.[0] ?? '?';
+    const mod = s['00080060']?.Value?.[0] || '';
+    opt.textContent = `[${num}] ${desc || mod} (${n} slices)`;
+    seriesPicker.appendChild(opt);
+  }
+  seriesPicker.addEventListener('change', () => loadSeries(seriesPicker.value));
+  await loadSeries(seriesPicker.value);
+}
+
+init().catch(err => showError(err.message || String(err)));
+</script>
+</body>
+</html>

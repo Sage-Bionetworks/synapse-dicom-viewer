@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.git/
+.gitignore
+logs/
+tests/
+scripts/
+*.md
+uv.lock
+.DS_Store

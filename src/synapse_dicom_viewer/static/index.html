@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>synapse-dicom-viewer</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 2rem auto; max-width: 720px; padding: 0 1rem; color: #1f2937; }
+  h1 { margin-bottom: .25rem; }
+  .subtitle { color: #6b7280; margin-top: 0; }
+  .card { border: 1px solid #e5e7eb; border-radius: 6px; padding: 1rem 1.25rem; margin-top: 1rem; }
+  .card h3 { margin-top: 0; }
+  table { border-collapse: collapse; width: 100%; margin-top: .5rem; }
+  th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid #f3f4f6; font-size: .9rem; }
+  a.btn, button.btn { display: inline-block; padding: .35rem .8rem; border: 1px solid #2563eb; color: #2563eb;
+    border-radius: 4px; text-decoration: none; font-size: .85rem; background: white; cursor: pointer; font: inherit; }
+  a.btn:hover, button.btn:hover { background: #2563eb; color: white; }
+  button.btn:disabled { opacity: .5; cursor: not-allowed; }
+  code { background: #f3f4f6; padding: .1rem .3rem; border-radius: 3px; font-size: .85rem; }
+  .muted { color: #6b7280; font-size: .85rem; }
+  input[type="text"], input[type="password"] {
+    padding: .4rem .55rem; border: 1px solid #d1d5db; border-radius: 4px; font: inherit; width: 100%;
+    box-sizing: border-box;
+  }
+  .row { display: flex; gap: .5rem; align-items: center; margin-top: .5rem; }
+  .row input { flex: 1; }
+  .ok { color: #16a34a; }
+  .err { color: #dc2626; }
+</style>
+</head>
+<body>
+<h1>synapse-dicom-viewer</h1>
+<p class="subtitle">Lightweight DICOMweb shim for Synapse-hosted radiology data.</p>
+
+<div class="card" id="auth-card" hidden>
+  <h3>Synapse credentials</h3>
+  <p class="muted">Paste a <a href="https://www.synapse.org/Profile:v/settings" target="_blank">Synapse Personal Access Token</a>
+    with view permission. Stored encrypted server-side; decrypted only when refreshing presigned URLs.</p>
+  <div class="row">
+    <input type="password" id="pat-input" placeholder="eyJ0eXAiOi…" autocomplete="off">
+    <button class="btn" id="pat-connect">Connect</button>
+    <button class="btn" id="pat-clear" style="border-color:#dc2626;color:#dc2626" title="Clear stored PAT, server cache, and reload">Clear</button>
+  </div>
+  <p class="muted" id="pat-status" style="margin-top: .5rem;"></p>
+</div>
+
+<div class="card" id="folder-card" hidden>
+  <h3>Folder to view</h3>
+  <div class="row">
+    <input type="text" id="folder-input" placeholder="syn12345678">
+    <button class="btn" id="folder-go">Open</button>
+  </div>
+  <p class="muted" id="folder-status" style="margin-top: .5rem;"></p>
+</div>
+
+<div class="card" id="status-card">
+  <h3>Loaded source</h3>
+  <p class="muted" id="source-info">checking…</p>
+  <table id="study-table" hidden>
+    <thead><tr><th>Patient</th><th>Modality</th><th>Series</th><th>Instances</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h3>API</h3>
+  <ul>
+    <li><code>GET /dicom-web/studies</code> — QIDO study list</li>
+    <li><code>GET /dicom-web/studies/{}/series/{}/metadata</code> — series metadata</li>
+    <li><code>GET /dicom-web/studies/{}/series/{}/instances/{}</code> — WADO-RS retrieve</li>
+    <li><code>POST /api/index?folder_id=synXXX</code> — index a Synapse folder</li>
+    <li><code>GET /auth/me</code> · <code>POST /auth/validate</code></li>
+  </ul>
+</div>
+
+<script>
+const SS_PAT_KEY = 'synapseDicomViewer.pat';
+
+async function checkAuth() {
+  const r = await fetch('/auth/me');
+  return await r.json();
+}
+
+function getStoredToken() { return sessionStorage.getItem(SS_PAT_KEY) || ''; }
+function storeToken(t)   { sessionStorage.setItem(SS_PAT_KEY, t); }
+function clearToken()    { sessionStorage.removeItem(SS_PAT_KEY); }
+
+function authHeaders() {
+  const t = getStoredToken();
+  return t ? { 'X-Synapse-Token': t } : {};
+}
+
+async function connectPat() {
+  const input = document.getElementById('pat-input');
+  const status = document.getElementById('pat-status');
+  const token = input.value.trim();
+  if (!token) return;
+  status.textContent = 'validating…';
+  status.className = 'muted';
+  try {
+    const r = await fetch('/auth/validate', { method: 'POST', headers: { 'X-Synapse-Token': token } });
+    if (!r.ok) throw new Error(await r.text() || `HTTP ${r.status}`);
+    const profile = await r.json();
+    storeToken(token);
+    status.textContent = `connected as ${profile.username}`;
+    status.className = 'ok';
+    input.value = '••••••••';
+    document.getElementById('folder-card').hidden = false;
+    document.getElementById('folder-input').focus();
+  } catch (e) {
+    status.textContent = 'failed: ' + e.message;
+    status.className = 'err';
+  }
+}
+
+async function loadFolder() {
+  const input = document.getElementById('folder-input');
+  const status = document.getElementById('folder-status');
+  const folderId = input.value.trim();
+  if (!/^syn\d+$/i.test(folderId)) {
+    status.textContent = 'expected a syn ID like syn12345678';
+    status.className = 'err';
+    return;
+  }
+  status.textContent = 'building index — this can take 5-30s for large folders…';
+  status.className = 'muted';
+  try {
+    const r = await fetch(`/api/index?folder_id=${encodeURIComponent(folderId)}`, {
+      method: 'POST', headers: { ...authHeaders() },
+    });
+    if (!r.ok) throw new Error(await r.text() || `HTTP ${r.status}`);
+    const data = await r.json();
+    if (!data.studies?.length) throw new Error('no studies indexed');
+    location.href = `/viewer-mini.html?StudyInstanceUIDs=${encodeURIComponent(data.studies[0])}`;
+  } catch (e) {
+    status.textContent = 'failed: ' + e.message;
+    status.className = 'err';
+  }
+}
+
+async function refreshState() {
+  const r = await fetch('/api/state', { headers: authHeaders() });
+  const data = await r.json();
+  const info = document.getElementById('source-info');
+  const table = document.getElementById('study-table');
+  const tbody = table.querySelector('tbody');
+  if (!data.source) {
+    info.textContent = 'No folder loaded yet.';
+    return;
+  }
+  info.innerHTML = 'Source: <code>' + data.source + '</code>'
+    + (data.indexing ? ' (indexing…)' : '')
+    + (data.cache ? ` &nbsp;·&nbsp; cache: ${data.cache.entries} instances / ${(data.cache.bytes/1e6).toFixed(1)} MB` : '');
+  if (data.studies?.length) {
+    table.hidden = false;
+    tbody.innerHTML = '';
+    for (const s of data.studies) {
+      const tr = document.createElement('tr');
+      const url = `/viewer-mini.html?StudyInstanceUIDs=${encodeURIComponent(s.study_instance_uid)}`;
+      tr.innerHTML = `
+        <td>${s.patient_name || '—'}</td>
+        <td>${s.modality}</td>
+        <td>${s.n_series}</td>
+        <td>${s.n_instances}</td>
+        <td><a class="btn" href="${url}">Open</a></td>`;
+      tbody.appendChild(tr);
+    }
+    if (data.studies.length === 1 && !window.location.search.includes('noredirect')) {
+      const auto = `/viewer-mini.html?StudyInstanceUIDs=${encodeURIComponent(data.studies[0].study_instance_uid)}`;
+      setTimeout(() => { window.location.href = auto; }, 800);
+    }
+  } else if (data.indexing) {
+    setTimeout(refreshState, 1000);
+  }
+}
+
+(async () => {
+  const auth = await checkAuth();
+  const authCard = document.getElementById('auth-card');
+  const folderCard = document.getElementById('folder-card');
+
+  if (auth.mode === 'hosted') {
+    authCard.hidden = false;
+    document.getElementById('pat-connect').addEventListener('click', connectPat);
+    document.getElementById('pat-input').addEventListener('keydown', e => { if (e.key === 'Enter') connectPat(); });
+    document.getElementById('pat-clear').addEventListener('click', async () => {
+      clearToken();
+      try { await fetch('/api/clear', { method: 'POST' }); } catch {}
+      location.reload();
+    });
+    // Restore previously-entered token
+    if (getStoredToken()) {
+      document.getElementById('pat-input').value = '••••••••';
+      // Re-validate silently so the server has a fresh encrypted copy
+      try {
+        const r = await fetch('/auth/validate', { method: 'POST', headers: { 'X-Synapse-Token': getStoredToken() } });
+        if (r.ok) {
+          const p = await r.json();
+          document.getElementById('pat-status').textContent = `connected as ${p.username}`;
+          document.getElementById('pat-status').className = 'ok';
+          folderCard.hidden = false;
+        }
+      } catch {}
+    }
+  } else {
+    folderCard.hidden = false;
+  }
+
+  document.getElementById('folder-go').addEventListener('click', loadFolder);
+  document.getElementById('folder-input').addEventListener('keydown', e => { if (e.key === 'Enter') loadFolder(); });
+
+  refreshState();
+})();
+</script>
+</body>
+</html>

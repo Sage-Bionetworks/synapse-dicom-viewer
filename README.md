@@ -4,10 +4,6 @@ Lightweight DICOMweb shim for Synapse-hosted radiology data, with a CDN-loaded
 CornerstoneJS demo viewer. Sister project to
 [synapse-avivator](https://github.com/Sage-Bionetworks/synapse-avivator).
 
-**Live demo (Cloud Run, us-east1):**
-[`https://synapse-dicom-viewer-350460119293.us-east1.run.app/`](https://synapse-dicom-viewer-350460119293.us-east1.run.app/)
-— bring a Synapse Personal Access Token and a folder ID containing `.dcm` files.
-
 ## What this does
 
 A thin FastAPI service that:
